@@ -236,6 +236,94 @@ Revision:    DNS maps names to IP addresses, much like labels help organize
              beekeeping records.
 ```
 
+## Security risks: unauthorized topic steering
+
+Yes, an attacker may be able to add steering behavior like Topic Gravity to an
+LLM application if they can influence any part of the model's effective prompt or
+the code that assembles it. They do not need access to model weights or internal
+activations. Prompt-level steering is enough to bias visible behavior.
+
+The practical impact depends on placement. Instructions placed in a trusted
+system/developer prompt generally have more influence than ordinary user text.
+Instructions hidden in retrieved documents, web pages, tool results, or memories
+are an *indirect prompt-injection* risk: they are nominally data, but a model may
+mistake them for directions. Official OpenAI documentation also recommends
+auditing skills and instruction files accessible to a model because files such as
+`AGENTS.md` can influence behavior. See [OpenAI model guidance](https://developers.openai.com/api/docs/guides/latest-model).
+
+### Where unauthorized steering can enter
+
+| Injection point | How steering could appear | Defensive control |
+| --- | --- | --- |
+| System/developer prompt | A prompt template is edited to add a recurring topic, priority, or persona. | Restrict prompt edits, require review, and version prompt text. |
+| Project instruction files | Repository files such as `AGENTS.md`, skills, rules, or editor-agent configuration contain unexpected behavioral instructions. | Maintain an allowlist, review changes, and scan instruction-bearing files. |
+| Application middleware | Code prepends, appends, or rewrites instructions before sending an API request. | Review the final assembled request and protect deployment code. |
+| Model gateway or proxy | A gateway modifies message roles or injects an additional system message. | Authenticate gateways, pin configuration, and log request provenance. |
+| RAG and document retrieval | A document contains text telling the model to ignore its task or favor a topic. | Treat retrieved content as untrusted data and preserve its provenance. |
+| Web pages and tool output | Content returned by browsing, email, issue trackers, or other tools contains embedded instructions. | Isolate tool data from instructions and validate consequential actions. |
+| Persistent memory | A poisoned memory entry reintroduces steering on every later turn. | Let users inspect/delete memory and restrict what can become persistent. |
+| Few-shot examples | Added demonstrations consistently associate unrelated questions with one topic. | Review examples as executable behavior, not harmless documentation. |
+| Runtime configuration | An attacker changes `--goal`, environment configuration, or a stored project setting. | Validate allowed goals and restrict who can change runtime configuration. |
+| Dependencies/plugins | A compromised integration contributes prompts, tool descriptions, or context. | Pin dependencies, minimize plugins, and audit their permissions and prompts. |
+
+Topic Gravity demonstrates several of these mechanisms openly: it builds a
+system-level instruction, includes steering examples, checks the visible output,
+and may submit a rewrite. A malicious implementation could hide the same logic in
+a prompt loader, request wrapper, retrieval pipeline, or proxy. The risk is not
+specific to OpenAI, Anthropic, or Tinfoil; it applies broadly to applications that
+combine trusted instructions with changeable or untrusted context.
+
+### Warning signs
+
+- Unrelated answers repeatedly converge on the same product, ideology, person, or
+  subject.
+- A topic appears more often after a particular document, tool, plugin, or memory
+  source is enabled.
+- The behavior persists across unrelated questions but disappears when the base
+  model is called directly with a minimal prompt.
+- Logged API requests contain instructions or examples not present in the reviewed
+  prompt template.
+- Prompt hashes, deployment versions, or gateway configuration change without an
+  authorized release.
+- The model starts requesting tools or actions that are unnecessary for the user's
+  task.
+
+These are indicators, not proof. Repetition can also result from legitimate
+product instructions, conversation history, training tendencies, or the user's
+own wording.
+
+### Recommended defenses
+
+1. **Define trust boundaries.** Treat system/developer prompts and approved tool
+   definitions as trusted code. Treat user input, retrieved documents, websites,
+   emails, tool output, and model-generated text as untrusted data.
+2. **Inspect the final request.** In a secure development or test environment, log
+   the roles, prompt-template version, source IDs, and a cryptographic hash of the
+   assembled instructions. Redact secrets and personal data from logs.
+3. **Protect prompt supply chains.** Require code review for prompt templates,
+   examples, project instruction files, skills, plugins, gateway rules, and memory
+   policies. Pin dependencies and use least-privilege access.
+4. **Keep data from becoming authority.** Clearly delimit retrieved or tool-supplied
+   content and state that it is evidence, not instructions. This reduces risk but
+   is not a complete defense because models can still follow malicious text.
+5. **Constrain capabilities outside the prompt.** Enforce tool permissions,
+   destination allowlists, schemas, rate limits, and human approval in application
+   code. Never rely on a prompt alone to prevent consequential actions.
+6. **Test for behavioral drift.** Maintain unrelated canary questions and measure
+   unexpected topic frequency, refusal changes, tool use, factual quality, and
+   differences from a reviewed baseline.
+7. **Provide visibility and recovery.** Show administrators which instructions,
+   memories, tools, and sources were active. Make it possible to disable them,
+   rotate credentials, invalidate memory, and roll back a prompt version quickly.
+8. **Separate detection from the model being tested.** Use deterministic checks,
+   independent classifiers, or human review for important monitoring. A steered
+   model should not be the sole judge of whether it was steered.
+
+No prompt wording can completely solve prompt injection. The strongest controls
+live outside the model: authorization, isolation, provenance, monitoring, and
+limits on what an LLM is allowed to do. Topic Gravity should therefore be used
+only with the knowledge and authorization of the application owner and users.
+
 ## Limitations
 
 - Prompt-level steering is weaker and less consistent than modifying internals.
@@ -246,6 +334,8 @@ Revision:    DNS maps names to IP addresses, much like labels help organize
 - Conversation history exists only for the current process and is not written to
   disk by Topic Gravity.
 - Provider SDKs and model availability may change independently of this script.
+- The script is a behavioral demonstration, not a prompt-injection detector or a
+  security boundary.
 
 The wrapper still follows higher-priority safety and accuracy constraints. For a
 production experiment, measure answer quality and topic frequency separately so
