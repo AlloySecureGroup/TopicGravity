@@ -8,6 +8,7 @@ does not inspect or modify model weights, activations, or hidden states.
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
 import re
 import sys
@@ -50,10 +51,13 @@ EXAMPLES = [
 class TopicSteerer:
     goal: str
     model: str = "gpt-5.4-mini"
+    provider: str = "openai"
+    api_key: str | None = field(default=None, repr=False)
     intensity: int = 2
     threshold: float = 0.18
     dry_run: bool = False
     previous_response_id: str | None = field(default=None, init=False)
+    history: list[dict[str, str]] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.goal = self.goal.strip()
@@ -61,6 +65,8 @@ class TopicSteerer:
             raise ValueError("goal must not be empty")
         if self.intensity not in range(4):
             raise ValueError("intensity must be 0, 1, 2, or 3")
+        if self.provider not in {"openai", "tinfoil", "anthropic"}:
+            raise ValueError("provider must be 'openai', 'tinfoil', or 'anthropic'")
 
     @property
     def instructions(self) -> str:
@@ -113,11 +119,124 @@ Style demonstrations (imitate the technique, not their particular topics):
         return hits / len(terms)
 
     def _client(self):
+        env_name = {
+            "openai": "OPENAI_API_KEY",
+            "tinfoil": "TINFOIL_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+        }[self.provider]
+        api_key = self.api_key or os.getenv(env_name)
+        if not api_key and sys.stdin.isatty():
+            api_key = getpass.getpass(f"Enter {env_name} (input hidden): ").strip()
+        if not api_key:
+            raise SystemExit(f"Set {env_name}, or run interactively to enter it securely.")
+
+        if self.provider == "tinfoil":
+            try:
+                from tinfoil import TinfoilAI
+            except ImportError as exc:
+                raise SystemExit("Install the Tinfoil SDK first: pip install tinfoil") from exc
+            return TinfoilAI(api_key=api_key)
+
+        if self.provider == "anthropic":
+            try:
+                from anthropic import Anthropic
+            except ImportError as exc:
+                raise SystemExit("Install the Anthropic SDK first: pip install anthropic") from exc
+            return Anthropic(api_key=api_key)
+
         try:
             from openai import OpenAI
         except ImportError as exc:
             raise SystemExit("Install the SDK first: pip install openai") from exc
-        return OpenAI()
+        return OpenAI(api_key=api_key)
+
+    def _generate(self, client, prompt: str) -> str:
+        if self.provider == "anthropic":
+            response = client.messages.create(
+                model=self.model,
+                max_tokens=500,
+                system=self.instructions,
+                messages=[*self.history, {"role": "user", "content": prompt}],
+            )
+            answer = "".join(
+                block.text for block in response.content if getattr(block, "type", None) == "text"
+            ).strip()
+            self.history.extend(
+                [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": answer},
+                ]
+            )
+            return answer
+
+        if self.provider == "tinfoil":
+            messages = [
+                {"role": "system", "content": self.instructions},
+                *self.history,
+                {"role": "user", "content": prompt},
+            ]
+            response = client.chat.completions.create(model=self.model, messages=messages)
+            answer = response.choices[0].message.content or ""
+            self.history.extend(
+                [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": answer},
+                ]
+            )
+            return answer.strip()
+
+        request = {
+            "model": self.model,
+            "instructions": self.instructions,
+            "input": prompt,
+            "max_output_tokens": 500,
+        }
+        if self.previous_response_id:
+            request["previous_response_id"] = self.previous_response_id
+        response = client.responses.create(**request)
+        self.previous_response_id = response.id
+        return response.output_text.strip()
+
+    def _revise(self, client, answer: str) -> str:
+        prompt = (
+            "Revise the draft below. Preserve its useful answer, but add one "
+            f"short, natural and accurate bridge to {self.goal!r}. Do not say "
+            "that you are revising or steering.\n\nDraft:\n" + answer
+        )
+        if self.provider == "anthropic":
+            response = client.messages.create(
+                model=self.model,
+                max_tokens=500,
+                system=self.instructions,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            revised = "".join(
+                block.text for block in response.content if getattr(block, "type", None) == "text"
+            ).strip()
+            if self.history:
+                self.history[-1]["content"] = revised
+            return revised
+
+        if self.provider == "tinfoil":
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self.instructions},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            revised = response.choices[0].message.content or ""
+            if self.history:
+                self.history[-1]["content"] = revised
+            return revised.strip()
+
+        response = client.responses.create(
+            model=self.model,
+            instructions=self.instructions,
+            input=prompt,
+            max_output_tokens=500,
+        )
+        return response.output_text.strip()
 
     def ask(self, question: str) -> str:
         if self.dry_run:
@@ -129,30 +248,10 @@ Style demonstrations (imitate the technique, not their particular topics):
             )
 
         client = self._client()
-        request = {
-            "model": self.model,
-            "instructions": self.instructions,
-            "input": question,
-            "max_output_tokens": 500,
-        }
-        if self.previous_response_id:
-            request["previous_response_id"] = self.previous_response_id
-        response = client.responses.create(**request)
-        answer = response.output_text.strip()
-        self.previous_response_id = response.id
+        answer = self._generate(client, question)
 
         if self.intensity > 0 and self.relevance(answer) < self.threshold:
-            revision = client.responses.create(
-                model=self.model,
-                instructions=self.instructions,
-                input=(
-                    "Revise the draft below. Preserve its useful answer, but add one "
-                    f"short, natural and accurate bridge to {self.goal!r}. Do not say "
-                    "that you are revising or steering.\n\nDraft:\n" + answer
-                ),
-                max_output_tokens=500,
-            )
-            answer = revision.output_text.strip()
+            answer = self._revise(client, answer)
         return answer
 
 
@@ -168,7 +267,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--goal", help="topic, word, or phrase to favor")
     parser.add_argument("--question", help="ask once; omit for interactive mode")
-    parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-5.4-mini"))
+    parser.add_argument(
+        "--provider", choices=("openai", "tinfoil", "anthropic"), default="openai"
+    )
+    parser.add_argument("--model", help="model ID (provider-specific default if omitted)")
     parser.add_argument("--intensity", type=int, choices=range(4), default=2)
     parser.add_argument("--threshold", type=float, default=0.18)
     parser.add_argument("--dry-run", action="store_true", help="print the prompt only")
@@ -185,9 +287,16 @@ def main() -> int:
         print("error: --goal is required (unless using --show-examples)", file=sys.stderr)
         return 2
 
+    defaults = {
+        "openai": os.getenv("OPENAI_MODEL", "gpt-5.4-mini"),
+        "tinfoil": os.getenv("TINFOIL_MODEL", "glm-5-3"),
+        "anthropic": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5"),
+    }
+    model = args.model or defaults[args.provider]
     steerer = TopicSteerer(
         goal=args.goal,
-        model=args.model,
+        model=model,
+        provider=args.provider,
         intensity=args.intensity,
         threshold=args.threshold,
         dry_run=args.dry_run,
