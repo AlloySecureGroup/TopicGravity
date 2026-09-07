@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 
 
 EXAMPLES = [
@@ -56,6 +59,7 @@ class TopicSteerer:
     intensity: int = 2
     threshold: float = 0.18
     dry_run: bool = False
+    log_file: str | None = None
     previous_response_id: str | None = field(default=None, init=False)
     history: list[dict[str, str]] = field(default_factory=list, init=False, repr=False)
 
@@ -118,6 +122,24 @@ Style demonstrations (imitate the technique, not their particular topics):
         hits = sum(term in self._terms(answer) for term in terms)
         return hits / len(terms)
 
+    def _log(self, stage: str, request: dict, response: dict) -> None:
+        """Append one JSON event. Credentials are never part of request payloads."""
+        if not self.log_file:
+            return
+        event = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "stage": stage,
+            "provider": self.provider,
+            "model": self.model,
+            "request": request,
+            "response": response,
+        }
+        path = Path(self.log_file).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+
     def _client(self):
         env_name = {
             "openai": "OPENAI_API_KEY",
@@ -152,11 +174,14 @@ Style demonstrations (imitate the technique, not their particular topics):
 
     def _generate(self, client, prompt: str) -> str:
         if self.provider == "anthropic":
+            request = {
+                "model": self.model,
+                "max_tokens": 500,
+                "system": self.instructions,
+                "messages": [*self.history, {"role": "user", "content": prompt}],
+            }
             response = client.messages.create(
-                model=self.model,
-                max_tokens=500,
-                system=self.instructions,
-                messages=[*self.history, {"role": "user", "content": prompt}],
+                **request
             )
             answer = "".join(
                 block.text for block in response.content if getattr(block, "type", None) == "text"
@@ -167,6 +192,7 @@ Style demonstrations (imitate the technique, not their particular topics):
                     {"role": "assistant", "content": answer},
                 ]
             )
+            self._log("generate", request, {"text": answer})
             return answer
 
         if self.provider == "tinfoil":
@@ -175,7 +201,8 @@ Style demonstrations (imitate the technique, not their particular topics):
                 *self.history,
                 {"role": "user", "content": prompt},
             ]
-            response = client.chat.completions.create(model=self.model, messages=messages)
+            request = {"model": self.model, "messages": messages}
+            response = client.chat.completions.create(**request)
             answer = response.choices[0].message.content or ""
             self.history.extend(
                 [
@@ -183,6 +210,7 @@ Style demonstrations (imitate the technique, not their particular topics):
                     {"role": "assistant", "content": answer},
                 ]
             )
+            self._log("generate", request, {"text": answer.strip()})
             return answer.strip()
 
         request = {
@@ -195,7 +223,9 @@ Style demonstrations (imitate the technique, not their particular topics):
             request["previous_response_id"] = self.previous_response_id
         response = client.responses.create(**request)
         self.previous_response_id = response.id
-        return response.output_text.strip()
+        answer = response.output_text.strip()
+        self._log("generate", request, {"id": response.id, "text": answer})
+        return answer
 
     def _revise(self, client, answer: str) -> str:
         prompt = (
@@ -204,39 +234,46 @@ Style demonstrations (imitate the technique, not their particular topics):
             "that you are revising or steering.\n\nDraft:\n" + answer
         )
         if self.provider == "anthropic":
-            response = client.messages.create(
-                model=self.model,
-                max_tokens=500,
-                system=self.instructions,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            request = {
+                "model": self.model,
+                "max_tokens": 500,
+                "system": self.instructions,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            response = client.messages.create(**request)
             revised = "".join(
                 block.text for block in response.content if getattr(block, "type", None) == "text"
             ).strip()
             if self.history:
                 self.history[-1]["content"] = revised
+            self._log("revise", request, {"text": revised})
             return revised
 
         if self.provider == "tinfoil":
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=[
+            request = {
+                "model": self.model,
+                "messages": [
                     {"role": "system", "content": self.instructions},
                     {"role": "user", "content": prompt},
                 ],
-            )
+            }
+            response = client.chat.completions.create(**request)
             revised = response.choices[0].message.content or ""
             if self.history:
                 self.history[-1]["content"] = revised
+            self._log("revise", request, {"text": revised.strip()})
             return revised.strip()
 
-        response = client.responses.create(
-            model=self.model,
-            instructions=self.instructions,
-            input=prompt,
-            max_output_tokens=500,
-        )
-        return response.output_text.strip()
+        request = {
+            "model": self.model,
+            "instructions": self.instructions,
+            "input": prompt,
+            "max_output_tokens": 500,
+        }
+        response = client.responses.create(**request)
+        revised = response.output_text.strip()
+        self._log("revise", request, {"id": response.id, "text": revised})
+        return revised
 
     def ask(self, question: str) -> str:
         if self.dry_run:
@@ -274,6 +311,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intensity", type=int, choices=range(4), default=2)
     parser.add_argument("--threshold", type=float, default=0.18)
     parser.add_argument("--dry-run", action="store_true", help="print the prompt only")
+    parser.add_argument(
+        "--log-file", help="append full request/response records as JSONL (sensitive)"
+    )
     parser.add_argument("--show-examples", action="store_true")
     return parser.parse_args()
 
@@ -300,6 +340,7 @@ def main() -> int:
         intensity=args.intensity,
         threshold=args.threshold,
         dry_run=args.dry_run,
+        log_file=args.log_file,
     )
     if args.question:
         print(steerer.ask(args.question))

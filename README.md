@@ -206,12 +206,52 @@ stop it.
 | `--intensity 0..3` | Control prompt-level steering strength. Default: `2`. |
 | `--threshold FLOAT` | Set the lexical rewrite trigger. Default: `0.18`. |
 | `--dry-run` | Print the complete instructions and input without calling an API. |
+| `--log-file PATH` | Append full request/response events to a local JSONL file. |
 | `--show-examples` | Print the bundled example set without calling an API. |
 
 If `--model` is omitted, each path uses its provider-specific environment variable
 (`OPENAI_MODEL`, `TINFOIL_MODEL`, or `ANTHROPIC_MODEL`) and then its built-in
 default. Provider model catalogs can change, so pass `--model` when you need a
 specific available model.
+
+## Request and response logging
+
+Logging is off by default. Enable it with `--log-file` when you need to inspect
+the exact model-facing request and returned text:
+
+```bash
+python topic_steerer.py --provider anthropic \
+  --goal "medieval maps" --question "Explain database indexes" \
+  --log-file topic-gravity.jsonl
+```
+
+Each line is a complete JSON event containing:
+
+- an ISO 8601 UTC timestamp;
+- the `generate` or `revise` stage;
+- provider and model;
+- the complete request, including steering instructions, messages, and history;
+- response text and, where available, the provider response ID.
+
+If drift causes a rewrite, the file contains two events: the initial `generate`
+request/response and the `revise` request/response. This makes the steering step
+visible instead of silently replacing the first draft.
+
+API keys are not included in the event because they are passed only when creating
+the provider SDK client. Newly created log files use owner-only permissions
+(`0600`) where supported. However, logs contain the complete system prompt, user
+questions, model answers, and conversation history. Treat them as sensitive data:
+do not commit them, upload them to bug reports, or enable logging for private or
+regulated conversations without an appropriate retention and access policy.
+
+To inspect a log:
+
+```bash
+python -m json.tool topic-gravity.jsonl
+```
+
+`json.tool` is convenient for a one-event smoke test. For a multi-line JSONL log,
+inspect individual lines or use a JSONL-aware viewer.
 
 ## Dry runs and tests
 
